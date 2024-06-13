@@ -1,0 +1,240 @@
+"""
+FAST GENOME CLASSIFIER IS A TOOL FOR QUICKLY AND ACCURATELY CLASSIFYING PROKARYOTIC GENOMES
+Author: Ayixon Sanchez Reyes
+Developers: Ayixon Sanchez Reyes, Karel Estrada
+Affiliation:Computational Microbiology. Microbiological Observatory. Institute of Biotechnology, UNAM, Cuernavaca, MEXICO
+            Unidad Universitaria de Secuenciacion Masiva y Bioinformatica. Institute of Biotechnology, UNAM, Cuernavaca, MEXICO
+Latest modification: Sun Dec 31, 2023
+"""
+
+rule help:
+    shell:
+        r"""
+        echo "Usage: snakemake [Targets] [Options] -s /path/to/Snakefile_genomescanner"
+        echo ""
+        echo "Targets:"
+        echo "  all          Run the full analysis pipeline"
+        echo "  help         Show this help message"
+        echo ""
+        echo "Options:"
+        echo "  --cores        Specify the maximum number of CPU cores to be used at the same time. If you want to use N cores, say --cores N or -cN. For all cores on your system (be sure that this is appropriate) use --cores all. For no parallelization use --cores 1 or -c1"
+        echo ""
+        echo "  --config/DB    Optionally, you can provide the path to your own database formatted for Mash"
+        echo ""
+        echo "  --config/REF   Reference genome to classify"
+        echo ""
+        echo "Examples:"
+        echo "  $ snakemake help -qc1 -s /home/karel/bin/Snakefile_genomescanner  #  Show this help message"
+        echo "  $ snakemake all --cores all --config REF=ecoli.fna DB=DB.msh -s /home/karel/bin/Snakefile_genomescanner  >> genomescanner.log  #  Run the entire pipeline using all available cores, your own Mash database (DB.msh), and the E.coli DNA genome for classification"
+	echo ""
+        echo -e "For more information, please read the documentation or contact the developers.\n"
+        """
+
+if "REF" in config.keys():
+    REF = config["REF"]
+else:
+    REF = "ref.fna"
+
+if "DB" in config.keys():
+    DB = config["DB"]
+else:
+    DB = "/free/databases/rapdtool/GTDBr202_plus_NCBI_type_material.msh"
+
+log_dir = "logs"
+
+rule all:
+    input:
+        "Mash_out/dist.uniq",
+        "Mash_out/output.mash.txt",
+        "logs/ANI",
+        "logs/download_genomes",
+        "JolyTree_out",
+        "FastANI_out",
+        "sp_Results"
+
+rule check_commands:
+    output:
+        "check_commands.log"
+    shell:
+        """
+        check_commands_Snakefile_genomescanner.py
+        echo "All required commands are available" > {output}
+        """
+
+rule mash:
+    input:
+        {REF},
+        "check_commands.log",
+        {DB}
+    output:
+        "Mash_out/output.mash.txt"
+    threads:
+        workflow.cores
+    message:
+        "Estimate Mash distance with the input files"
+    shell:
+        '''
+        mash dist {input[0]} {input[2]} -p {threads} | sort -n -k3 > {output}
+        '''
+
+rule mash_fil:
+    input:
+        rules.mash.output,
+        "check_commands.log"
+    output:
+        "Mash_out/dist.uniq",
+	temp("Mash_out/temp")
+    message:
+        "MASH analysis top hits"
+    shell:
+        '''
+        echo -e "MASH analysis top hits\\n"
+        echo "Query,Reference,D,p_value,shared hashed" | column -t -s ','
+        head {input[0]}
+        cut -f2,3 {input[0]} | awk '!seen[$2]++' | head -30 > {output[0]}
+	cut -f2,3 {input[0]} > {output[1]}
+	cantidad=$(cat {output[0]} | wc -l)
+        if (($cantidad < 30));
+	    then
+	        tail -1 {output[0]} | cut -f1 | grep -w -A $(calc 30-"$cantidad") -f - {output[1]} | sed '1d' >> {output[0]}
+        fi
+        '''
+
+rule ani:
+    input:
+        rules.mash_fil.output[0],
+        rules.mash.output,
+        "check_commands.log"
+    output:
+        temp("ANI.tmp"),
+        "logs/ANI"
+    message:
+        "Printing the distance table (Mash D) / Approximate ANI as 1-Distance"
+    shell:
+        """
+        echo -e "Printing the distance table (Mash D) / Approximate ANI as 1-Distance\n"
+        while IFS='\t' read -r name val; do
+            sort -n -k3 {input[1]} > {output[0]}
+            grep -m1 -F "$name" {output[0]} | cut -f2 >> {output[1]}
+            grep -m1 -F "$name" {output[0]}
+            var1=$(calc 1-"$val")
+            echo "Computing approximate ANI"
+            echo $var1 >> {output[1]}
+            echo $var1
+            if (( $(bc <<< "$var1 >= 0.95") ));
+                then
+                    echo "**** Genomic Coherence Detected ****" >> {output[1]}
+                    echo "**** Genomic Coherence Detected ****"
+                    echo -e "--------------------------\\n" >> {output[1]}
+                    echo -e "--------------------------\\n"
+                else
+                    echo -e "--------------------------\\n" >> {output[1]}
+                    echo -e "--------------------------\\n"
+            fi
+        done < {input[0]}
+        """
+
+rule download_genomes:
+    input:
+        rules.mash_fil.output[0],
+        {REF},
+        "check_commands.log"
+    output:
+        temp("Genome_accnumber.txt"),
+        "logs/download_genomes",
+        temp(directory("ncbigenomes"))
+    message:
+        "Downloading the reference genomes from NCBI"
+    shell:
+        """
+        echo -e "\nDownloading the reference genomes from NCBI...\n"
+        mkdir -p JolyTree_in
+        cp -f {input[1]} JolyTree_in
+        while IFS='\t' read -r name val; do
+            echo $name | cut -d'_' -f1,2 >> Genome_accnumber.txt
+        done < {input[0]}
+        datasets download genome accession --inputfile Genome_accnumber.txt --include genome > /dev/null 2>&1
+        unzip ncbi_dataset.zip -d {output[2]}
+        find  {output[2]} -type f -name '*.fna' -exec mv {{}} JolyTree_in \;
+        rm -rf ncbi_dataset.zip
+        echo "\nDownload successful\n=============================================================================================================="
+        touch {output[1]}
+        """
+
+rule phylogenetic_analysis:
+    input:
+        {REF},
+        rules.download_genomes.output[1],
+        "check_commands.log"
+    output:
+        directory("JolyTree_out"),
+        "logs/phylogenetic_analysis"
+    threads:
+        workflow.cores/2
+    message:
+        "Starting Phylogenetic Analysis with JolyTree..."
+    shell:
+        '''
+        echo -e "\\nStarting Phylogenetic Analysis with JolyTree\\n"
+        mkdir {output[0]}
+        JolyTree.sh -i JolyTree_in/ -b {output[0]}/out_tree -t {threads} 2>{output[1]}
+        '''
+
+rule compute_fastani:
+    input:
+        {REF},
+        rules.download_genomes.output[1],
+        "check_commands.log"
+    output:
+        directory("FastANI_out")
+    threads:
+        workflow.cores/2
+    message:
+        "Computing FastAni..."
+    shell:
+        """
+        echo -e "Computing FastAni\n---------------------------------------"
+        echo  Genome_Query: {input[0]}
+        cd JolyTree_in
+        for ani in *.fna; do
+#            orthoani --jobs {threads} -q {input[0]} -r $ani > $ani.txt
+            fastANI -q {input[0]} -r $ani -t {threads} --fragLen 1000 --minFraction 0.1 -o $ani.txt > /dev/null 2>&1
+        done
+        for file in *.fna.txt; do
+            echo -n "${{file%.fna.txt}}"$'\t'
+            cat "${{file}}"
+        done  | sort -k2,2nr
+        mkdir {output}
+        mv *.txt {output}
+        mv {output} ..
+        cd ..
+        """
+
+rule species_delimitation:
+    input:
+        rules.phylogenetic_analysis.output[0],
+        "check_commands.log"
+    output:
+        results_dir=directory("sp_Results")
+    message:
+        "Computing Species Delimitation under Markov Chain Monte Carlo..."
+    shell:
+        """
+        echo -e "\nComputing Species Delimitation under Markov Chain Monte Carlo..."
+        mkdir -p {output.results_dir}
+        cd JolyTree_out/
+#        bPTP.py -t out_tree.nwk -o PTP_sp -s 1234 -r -i 1000000
+        micromamba run -n genomescanner bPTP.py -t out_tree.nwk -o PTP_sp -s 1234 -r -i 1000000
+        cd ..
+        mv JolyTree_out/PTP* {output.results_dir}/
+        echo -e "Speciation test done, look at the sp_Results directory"
+        echo ""
+        echo -e "=============================================================================================================="
+        echo ""
+        echo -e "Fast_Genome_Classifier pipeline done"
+        echo ""
+        echo -e "We recommend that you test the phylophenetic hypothesis about *Diagnostic Characters*"
+        echo -e "You may want to explore the following phenotypic determinants:"
+        echo -e "    Menaquinone biosynthesis including the menaquinone reductase gene (MenJ)"
+        echo -e "    Fatty acid synthesis cycle FASI, FASII"
+        """
